@@ -1,6 +1,6 @@
 * clean up debug junk
 * implement sending frames (with masking)
-* check server handshake
+* check server handshake (validate headers, etc)
 * finish / clean up client API
   (add defgenerics / default behavior, make sure names are consistent , etc)
 * testing

@@ -31,6 +31,10 @@ Sec-WebSocket-Version: 13
            (extensions ws))
    :encoding :ascii))
 
+(defmethod next-state (state &rest args)
+  (throw 'next-state (list state args)))
+
+
 ;; matchers take a ub8 buffer and start/end indices, and return either
 ;; offset of end of match in buffer
 ;; or nil for no match (yet)
@@ -82,18 +86,10 @@ Sec-WebSocket-Version: 13
             return (1+ bi))))))
 
 (defmethod get-match-octet ((ws web-socket))
-  (let ((c (%match ws)))
-    #++(assert (and c (plusp c)))
-    #++(setf (%match ws) (if (<= c 1)
-                          nil
-                          (1- c)))
-    (clws::read-octet (%read-buffer ws))))
+  (clws::read-octet (%read-buffer ws)))
 
 (defmethod get-match-as-vector ((ws web-socket))
-  (let ((c (%match ws)))
-    #++(assert (and c (plusp c)))
-    #++(setf (%match ws) nil)
-    (clws::get-octet-vector (%read-buffer ws))))
+  (clws::get-octet-vector (%read-buffer ws)))
 
 (defun dispatch-message (ws octet-count frames)
   (flet ((get-octets ()
@@ -111,8 +107,7 @@ Sec-WebSocket-Version: 13
        (let ((s (babel:octets-to-string (get-octets) :errorp nil)))
          (unless s
            (next-state :fail 1007 "failed to decode text message"))
-         (on-message (driver ws) s :string))
-       )
+         (on-message (driver ws) s :string)))
       (2
        (on-message (driver ws) (get-octets) :binary)))))
 
@@ -133,6 +128,16 @@ Sec-WebSocket-Version: 13
 )
 )
 
+(defmethod %send-close ((ws web-socket) &optional code reason)
+  (let ((reason (if (stringp reason)
+                    (babel:string-to-octets reason
+                                            :encoding :utf-8)
+                    reason))
+        (code (when code
+                (vector (ldb (byte 8 8) code)
+                        (ldb (byte 8 0) code)))))
+    (send-frame ws #x8 t (concatenate '(vector (unsigned-byte 8))
+                                      code reason))))
 ;;; state machine states:
 ;; opening - send handshake -> read headers
 ;; read headers - wait for crlf, split on =, etc until crlfcrlf -> check headers
@@ -143,38 +148,6 @@ Sec-WebSocket-Version: 13
 ;;   (default frame handler for clients buffers fragmented messages,
 ;;    and sends whole messages to client)
 
-(defmethod next-state (state &rest args)
-  (format t "next state -> ~s ~s~%" state args)
-  (throw 'next-state (list state args)))
-
-#++
-(defmethod run-state-machine ((ws web-socket) buffer start end)
-  (catch 'next-state
-    (loop for (test exit) in (%state ws)
-          when (setf (%match ws)
-                     (or (eq test t)
-                         (funcall test buffer start end)))
-            do (funcall exit)
-               (loop-finish))
-    nil))
-
-#++
-(defmethod run-state-machine ((ws web-socket) buffer start end)
-  ;; needs to handle 2 cases:
-  ;;   got new octets, in which case we just run on those
-  ;;   switched states, in which case we need to run on all already buffered data
-  (when buffer
-    (return-from run-state-machine (run-state-machine-once ws buffer start end)))
-  (loop until
-        (loop for chunk-buf in (clws::chunks (%read-buffer ws))
-              for buf = (clws::buffer-vector chunk-buf)
-              for start = (clws::buffer-start chunk-buf)
-              for end = (clws::buffer-end chunk-buf)
-              for (next . args) = (run-state-machine-once ws buf start end)
-              when next
-                do (apply #'enter-state ws next args)
-                and return nil
-              finally (return t))))
 
 (defmacro defstate (name (var &rest args) &body body &key entry exits)
   (declare (ignore body))
@@ -189,13 +162,6 @@ Sec-WebSocket-Version: 13
                                     ,state)))
            (setf (%state ,var) (reverse ,state)))))))
 
-#++
-(defstate :open (ws)
-  :entry (write-sequence (opening-handshake ws)
-                         conserv.tcp:*tcp-client*)
-  :exits ((t
-           (next-state :read-headers))))
-
 (defun validate-headers (ws)
   (format t "todo: validate headers ~s~%" (alexandria:hash-table-alist
                                            (%headers ws)))
@@ -207,13 +173,13 @@ Sec-WebSocket-Version: 13
                   (s (babel:octets-to-string b
                                              :encoding :iso-8859-1
                                              :end (- (length b) 2))))
-             (format t "got status line ~s~%" s)
+             (unless (string= s "HTTP/1.1 101 Switching Protocols")
+               (next-state :fail 1002))
              (next-state :read-headers)))))
 
 (defstate :read-headers (ws)
   :exits (((octet-pattern-matcher #(13 10 13 10))
            (let ((headers (clws::with-buffer-as-stream ((%read-buffer ws) s)
-                            ;(print (read-line s))
                             (chunga:read-http-headers s))))
              (setf (%headers ws)
                    (alexandria:alist-hash-table headers))
@@ -239,7 +205,6 @@ Sec-WebSocket-Version: 13
                                   :rsv2 (logbitp 5 opcode)
                                   :rsv3 (logbitp 4 opcode)
                                   :mask (logbitp 7 len1)))
-             (format t "started frame ~s ~s~%" opcode len)
              (case len
                (127
                 (next-state :read-length-64))
@@ -253,7 +218,7 @@ Sec-WebSocket-Version: 13
 
 (defstate :read-length-16 (ws)
   :exits (((octet-count-matcher 2)
-           (let ((len (logand (ash (get-match-octet ws) 8)
+           (let ((len (logior (ash (get-match-octet ws) 8)
                               (get-match-octet ws))))
              (when (> len (max-frame-size ws))
                (next-state :fail 1009 "frame too large"))
@@ -297,8 +262,7 @@ Sec-WebSocket-Version: 13
          (values :close code reason t)))
       (#x9 ;; ping
        (when (eq (connect-status ws) :open)
-         (%write-message ws #xa (data frame)))
-       )
+         (send-frame ws #xa t (data frame))))
       (#xa ;; pong
        ;; might as well send it to client, in case it wants to use it
        ;; to measure latency or something...
@@ -323,51 +287,85 @@ Sec-WebSocket-Version: 13
               (close (%socket ws)))
             (on-close (driver ws) (or code 1005) reason))
            (t
-            (%write-message ws #x8 (or code 1000)
-                            (babel:string-to-octets (or reason "")))
+            (%send-close ws (or code 1000)
+                         (or reason ""))
             (setf (slot-value ws 'connect-status) :closing))))
 
 
 (defstate :fail (ws code reason)
   :entry (progn
-           (%write-message ws #x8 code
-                           (babel:string-to-octets (or reason "")))
+           (%send-close ws code
+                       (babel:string-to-octets (or reason "")))
            (close (%socket ws) :abort t)
            (on-error (driver ws) code reason)
            (setf (slot-value ws 'connect-status) :closed)))
 
 (defmethod conserv.tcp:on-tcp-client-data ((ws web-socket) data)
-  (format t "got data ~s~%" (babel:octets-to-string data
-                                                    :encoding :iso-8859-1))
   (loop with start = 0
         with end = (length data)
         for (next args) = (catch 'next-state
-                            (format t "running state machine ~s on data from ~s..~s~%" (%state ws) start end)
                             (loop for (test exit) in (%state ws)
                                   for match = (or (eq test t)
                                                   (funcall test data start end))
                                   ;; if we got a match, add a chunk for the
                                   ;; matching part, then call the
                                   ;; exit edge (which should call next-state)
-                                  do (format t "match = ~s~%" match)
                                   when match
                                     do (clws::add-chunk (%read-buffer ws)
                                                         data start match)
                                        (setf start match)
-                                       (format t "exit state, start=~s,end=~s~%" start end)
                                        (funcall exit)
                                        (error "broken state machine?"))
                             ;; if we got here, none of the tests matched, so
                             ;; just store whatever is left of the buffer
-                            (clws::add-chunk (%read-buffer ws)
-                                             data start end)
+                            (unless (= start end)
+                              (clws::add-chunk (%read-buffer ws)
+                                                        data start end))
                             ;; and return nil to exit outer loop
                             nil)
-        do (format t "outer loop, next=~s,args=~s,start=~s,end=~s~%"
-                   next args start end)
         while next
         do (apply #'enter-state ws next args)))
 
-(trace enter-state)
-(trace octet-count-matcher)
-(trace octet-pattern-matcher)
+(defmethod send-frame ((ws web-socket) opcode fin payload)
+  (flet ((size-octets (x)
+           (cond ((< x 126) (values 0 x))
+                 ((< x 65536) (values 2 126))
+                 (t (values 8 127)))))
+    (let* ((l (length payload))
+           (buf (make-array (+ 2 (size-octets l) 4 l)
+                            :element-type '(unsigned-byte 8)))
+           (i -1)
+           (mask (make-array 4 :element-type '(unsigned-byte 8)
+                             :initial-contents (loop repeat 4
+                                                     collect (random 256)))))
+      (check-type opcode (unsigned-byte 4))
+      (setf (aref buf (incf i)) (logior (if fin #x80 0) opcode))
+      (setf (aref buf (incf i)) (logior #x80 (nth-value 1 (size-octets l))))
+      (when (< 125 l 65536)
+        (setf (aref buf (incf i)) (ldb (byte 8 8) l)
+              (aref buf (incf i)) (ldb (byte 8 0) l)))
+      (when (<= 65536 l)
+        (loop for i from 7 downto 0
+              do (setf (aref buf (incf i)) (ldb (byte 8 (* i 8)) l))))
+      (loop for m across mask
+            do (setf (aref buf (incf i)) m))
+      (loop for j from 0
+            for maskj = (aref mask (mod j 4))
+            for b across payload
+            do (setf (aref buf (incf i)) (logxor maskj b)))
+      (format t "send frame ~s~% = ~s~%"
+              buf (babel:octets-to-string buf :encoding :iso-8859-1))
+      (write-sequence buf (%socket ws))
+)
+
+)
+  )
+;; do we want to support any other message types besides string and binary?
+;; some sort of json maybe?
+(defmethod send-message ((ws web-socket) (message string))
+  (send-frame ws #x1 t (babel:string-to-octets message :encoding :utf-8)))
+
+(defmethod send-message ((ws web-socket) (message vector))
+  ;; message should only contain (unsigned-byte 8), not sure if there is
+  ;; any point in requiring types arrays though?
+  (send-frame ws #x2 t message))

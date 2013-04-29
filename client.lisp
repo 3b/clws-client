@@ -74,8 +74,7 @@
   )
 
 (defmethod ws-close ((ws web-socket) reason &key (block t))
-  
-  )
+  (%send-close ws 1000 reason))
 
 (defmethod initialize-instance :after ((ws web-socket) &key)
   (when (stringp (url ws))
@@ -87,11 +86,11 @@
 
 (defmethod conserv.tcp:on-tcp-client-close ((driver web-socket))
   (format t "client closed~%")
-  (on-close (driver driver) ""))
+  (on-close (driver driver) 1006 ""))
 
 (defmethod conserv.tcp:on-tcp-client-connect ((driver web-socket))
   (format t "client connected~%")
-  (write-sequence (print (opening-handshake driver))
+  (write-sequence (opening-handshake driver)
                   conserv.tcp:*tcp-client*)
   (enter-state driver :read-status-line))
 
@@ -115,14 +114,15 @@
                            :protocols protocols
                            :extensions extensions
                            :origin origin)))
-    (conserv.tcp::tcp-connect ws
-                              (puri:uri-host (url ws))
-                              :port (or (puri:uri-port (url ws)) 80)
-                              :wait t
-                              :external-format-in nil
-                              ;; only ever send text for HTTP headers,
-                              ;; since everything else gets masked
-                              :external-format-out :ascii)
+    (setf (%socket ws)
+          (conserv.tcp::tcp-connect ws
+                                    (puri:uri-host (url ws))
+                                    :port (or (puri:uri-port (url ws)) 80)
+                                    :wait t
+                                    :external-format-in nil
+                                    ;; only ever send text for HTTP headers,
+                                    ;; since everything else gets masked
+                                    :external-format-out :ascii))
     ))
 
 
@@ -134,11 +134,15 @@
 
 (defmethod on-message ((driver wsc-sample) message type)
   (format t "got message ~s~%" message)
+  (if (and (< (length message) 128) (string/= message "done"))
+    (send-message *web-socket* (format nil "got ~s!" message))
+    (send-message *web-socket* "done"))
+  (sleep 0.2)
   (when (equal message "done")
     (ws-close *web-socket* "got done")))
 
 (defmethod on-close ((driver wsc-sample) code reason)
-  (format t "closed, ~s~%" reason)
+  (format t "closed, ~s ~s~%" code reason)
   (conserv:exit-event-loop :delay 0.1))
 
 (conserv:with-event-loop ()
@@ -147,4 +151,3 @@
               :origin "http://localhost"))
 
 (setf clws::*log-level* t)
-
