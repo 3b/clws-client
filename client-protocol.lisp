@@ -174,7 +174,7 @@ Sec-WebSocket-Version: 13
                                              :encoding :iso-8859-1
                                              :end (- (length b) 2))))
              (unless (string= s "HTTP/1.1 101 Switching Protocols")
-               (next-state :fail 1002))
+               (next-state :fail 1002 ""))
              (next-state :read-headers)))))
 
 (defstate :read-headers (ws)
@@ -184,7 +184,9 @@ Sec-WebSocket-Version: 13
              (setf (%headers ws)
                    (alexandria:alist-hash-table headers))
              (if (validate-headers ws)
-                 (next-state :read-frame-start)
+                 (let ((*web-socket* ws))
+                   (on-connect (driver ws))
+                   (next-state :read-frame-start))
                  (next-state :fail 1002 "invalid headers"))))
           ((octet-count-matcher 65536)
            ;; possibly should limit per header line instead of all headers?
@@ -262,11 +264,13 @@ Sec-WebSocket-Version: 13
          (values :close code reason t)))
       (#x9 ;; ping
        (when (eq (connect-status ws) :open)
-         (send-frame ws #xa t (data frame))))
+         (send-frame ws #xa t (data frame)))
+       (values :read-frame-start))
       (#xa ;; pong
        ;; might as well send it to client, in case it wants to use it
        ;; to measure latency or something...
-       (on-pong (driver ws) (data frame)))
+       (on-pong (driver ws) (data frame))
+       (values :read-frame-start))
       (t
        (values :fail 1002 "unknown opcode")))))
 
@@ -353,7 +357,7 @@ Sec-WebSocket-Version: 13
             for maskj = (aref mask (mod j 4))
             for b across payload
             do (setf (aref buf (incf i)) (logxor maskj b)))
-      (format t "send frame ~s~% = ~s~%"
+      #++(format t "~&send frame ~s~% = ~s~%"
               buf (babel:octets-to-string buf :encoding :iso-8859-1))
       (write-sequence buf (%socket ws))
 )
@@ -369,3 +373,8 @@ Sec-WebSocket-Version: 13
   ;; message should only contain (unsigned-byte 8), not sure if there is
   ;; any point in requiring types arrays though?
   (send-frame ws #x2 t message))
+
+(defmethod send-ping ((ws web-socket) payload)
+  (when (stringp payload)
+    (setf payload (babel:string-to-octets payload :encoding :utf-8)))
+  (send-frame ws #x9 t (or payload (make-array 0 :element-type '(unsigned-byte 8)))))

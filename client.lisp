@@ -3,6 +3,22 @@
 #++
 (asdf:load-systems 'puri 'iolib 'babel 'cl-base64 'clws 'conserv 'chunga)
 
+
+;;; client api
+(defgeneric on-connect (driver))
+(defgeneric on-close (driver code reason))
+(defgeneric on-message (driver message type))
+(defgeneric on-pong (driver payload))
+
+;; ignore pong message by default
+(defmethod on-pong (driver payload))
+
+;; ops on open websocket
+(defgeneric send-message (ws message))
+(defgeneric send-ping (ws payload))
+
+
+
 ;; possible api:
 ;; CALLBACK is called for every chunk of data
 
@@ -100,6 +116,7 @@
   (format t "client got eof~%"))
 
 (defmethod conserv.tcp:on-tcp-client-error ((driver web-socket) error)
+  #++(break)
   (format t "client got error ~s~%" error))
 
 (defmethod conserv.tcp:on-tcp-client-output-empty ((driver web-socket))
@@ -145,6 +162,7 @@
   (format t "closed, ~s ~s~%" code reason)
   (conserv:exit-event-loop :delay 0.1))
 
+#++
 (conserv:with-event-loop ()
   (ws-connect (make-instance 'wsc-sample)
               "ws://localhost:12345/wsc-test"
