@@ -173,7 +173,8 @@ Sec-WebSocket-Version: 13
                   (s (babel:octets-to-string b
                                              :encoding :iso-8859-1
                                              :end (- (length b) 2))))
-             (unless (string= s "HTTP/1.1 101 Switching Protocols")
+             (unless (and (>= (length s) 13)
+                          (string= s "HTTP/1.1 101 " :end1 13)) ;; Switching Protocols
                (next-state :fail 1002 ""))
              (next-state :read-headers)))))
 
