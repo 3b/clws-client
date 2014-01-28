@@ -9,6 +9,7 @@
 (defgeneric on-close (driver code reason))
 (defgeneric on-message (driver message type))
 (defgeneric on-pong (driver payload))
+(defgeneric on-error (driver code reason))
 
 ;; ignore pong message by default
 (defmethod on-pong (driver payload))
